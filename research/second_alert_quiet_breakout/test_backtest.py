@@ -140,6 +140,104 @@ def test_exit_frees_slot_same_day():
     assert bt.run_book(book, params(slots=1), 0)["trades"] == 2
 
 
+# ------------------------------------------------------------------------ scale-in
+
+def test_support_levels():
+    highs = [101.0 + (i % 7) for i in range(40)]
+    lows = [99.0 - (i % 5) for i in range(40)]
+    s = series_from([100.0] * 40, highs=highs, lows=lows)
+    rule = lambda b, a: bt.EntryRule("x", breakout=b, first_frac=0.5, add_at=a)
+    assert bt.support_level(s, 30, rule("alert", "retest")) == 103.0          # the alert-day high
+    assert bt.support_level(s, 30, rule("hh20", "retest")) == 107.0           # the 20-session high
+    assert bt.support_level(s, 30, rule("alert", "alert_low")) == 99.0
+    assert bt.support_level(s, 30, rule("alert", "ll20")) == 95.0             # lowest low of sessions 11-30
+
+
+def test_find_add_limit_fill_gap_and_bounds():
+    closes, lows, opens = [100.0] * 40, [99.0] * 40, [100.0] * 40
+    lows[33] = 95.0                              # trades through 96 after opening above it
+    s = series_from(closes, lows=lows, opens=opens)
+    assert bt.find_add(s, 30, 39, "trail", 96.0) == (33, 96.0)
+    opens[33], lows[33] = 94.0, 93.0             # gaps below the level: the limit fills at the open
+    s = series_from(closes, lows=lows, opens=opens)
+    assert bt.find_add(s, 30, 39, "trail", 96.0) == (33, 94.0)
+    assert bt.find_add(s, 30, 33, "trail", 96.0) == (33, 94.0)   # fills on a trail-exit day (stop is on the close)
+    assert bt.find_add(s, 30, 33, "cap", 96.0) is None           # not on the day the cap closes the trade
+    assert bt.find_add(s, 30, 32, "trail", 96.0) is None         # never after the exit
+    assert bt.find_add(s, 33, 39, "trail", 96.0) is None         # never on the entry day
+    assert bt.find_add(s, 30, 39, "open", 90.0) is None          # never reaches the level
+
+
+def scale_in_series(base_low=99.0):
+    # flat base at 100 (alert day 80: high 101, low 99), break of 101 on day 81, a dip to 98.5 on
+    # day 84, a climb to 115 by day 99, then flat so the 63-session cap closes it on day 144
+    closes = np.array([100.0] * 81 + [103.0, 102.0, 101.0, 100.0] + list(np.linspace(101, 115, 15))
+                      + [115.0] * 50)
+    highs, lows, opens = closes + 1, closes - 1, closes.copy()
+    highs[81], opens[81] = 104.0, 100.5
+    lows[84], opens[84] = 98.5, 100.0
+    lows[70] = base_low
+    return series_from(closes, highs=highs, lows=lows, opens=opens)
+
+
+def test_scale_in_candidate_adds_at_support_and_splits_the_slot():
+    s = scale_in_series()
+    sec = pd.DataFrame([("AAA", pd.Timestamp(s.dates[80]), 80, 2)],
+                       columns=["symbol", "alert_date", "alert_i", "n_alert_sessions"])
+    p = params()
+    half = lambda add_at: bt.EntryRule("x", breakout="alert", first_frac=0.5, add_at=add_at)
+    r1, r2 = bt.leg_ret(101.0, 115.0, p.cost), bt.leg_ret(99.0, 115.0, p.cost)
+    (c,), stats = bt.build_candidates(sec, {"AAA": s}, half("alert_low"), p)
+    assert (c.fill, c.exit_reason, c.exit_px, c.held) == (101.0, "cap", 115.0, 63)
+    assert (c.add_px, c.add_lag, c.add_level, stats["added"]) == (99.0, 3, 99.0, 1)
+    assert abs(c.slot_ret - (0.5 * r1 + 0.5 * r2)) < 1e-12 and abs(c.ret - c.slot_ret) < 1e-12
+    # the retest reading buys the rest back at the broken high on the first dip to it
+    (c,), _ = bt.build_candidates(sec, {"AAA": s}, half("retest"), p)
+    assert (c.add_px, c.add_lag) == (101.0, 1)
+    # a base low the price never revisits: half the slot earns r1, the other half stays cash
+    (c,), stats = bt.build_candidates(sec, {"AAA": scale_in_series(base_low=97.0)}, half("ll20"), p)
+    assert c.add_date is None and c.add_level == 97.0 and "added" not in stats
+    assert abs(c.slot_ret - 0.5 * r1) < 1e-12 and abs(c.ret - r1) < 1e-12
+    # the same entry in one go is unchanged by any of this
+    (c,), _ = bt.build_candidates(sec, {"AAA": s}, bt.EntryRule("x", breakout="alert"), p)
+    assert c.slot_ret == c.ret == r1 and c.add_date is None
+
+
+def test_book_holds_back_second_half_and_adds_it():
+    s = {"A": series_from(np.r_[np.full(12, 100.0), np.full(88, 200.0)]), "B": series_from(np.full(100, 100.0))}
+    cal = pd.DatetimeIndex(s["A"].dates)
+    a = bt.Candidate("A", None, cal[10], 100.0, cal[40], 120.0, "trail", 30, 0.0, np.nan, 0, 0.0,
+                     first_frac=0.5, add_date=cal[15], add_px=90.0)
+    b = bt.Candidate("B", None, cal[12], 100.0, cal[30], 110.0, "trail", 18, 0.0, np.nan, 0, 0.0)
+    book = bt.prepare_book([a, b], s, cal, cal[0], cal[-1])
+    r = bt.run_book(book, params(slots=2, cost=0.0, capital=100_000), 0)
+    # A: slot 50,000 -> 250 sh at 100, 25,000 held back. B on day 12, with A marked at 200 (equity 125,000):
+    # slot = min(125,000 / 2, cash 75,000 - held 25,000) = 50,000 -> 500 sh, not the 625 that spending
+    # A's held half would allow. A then adds 25,000 // 90 = 277 sh
+    assert r["trades"] == 2 and r["adds"] == 1
+    assert abs(r["final"] - (100_000 - 25_000 - 50_000 - 277 * 90 + 500 * 110 + (250 + 277) * 120)) < 1e-6
+
+
+def test_book_scale_in_without_add_frees_the_held_half():
+    s = {k: series_from(np.full(100, 100.0)) for k in "AB"}
+    cal = pd.DatetimeIndex(s["A"].dates)
+    a = bt.Candidate("A", None, cal[10], 100.0, cal[20], 110.0, "trail", 10, 0.0, np.nan, 0, 0.0, first_frac=0.5)
+    b = bt.Candidate("B", None, cal[20], 100.0, cal[30], 100.0, "trail", 10, 0.0, np.nan, 0, 0.0)
+    book = bt.prepare_book([a, b], s, cal, cal[0], cal[-1])
+    r = bt.run_book(book, params(slots=1, cost=0.0, capital=100_000), 0)
+    # A buys 500 at 100 and never adds; its exit at 110 (+5,000) frees the slot and the held half,
+    # so B gets all 105,000 the same day
+    assert r["trades"] == 2 and r["adds"] == 0 and abs(r["final"] - 105_000) < 1e-6
+
+
+def test_scale_in_rules_read_against_their_full_size_twin():
+    rules = bt.default_rules(0.5)
+    by = {r.name[:2]: r for r in rules}
+    assert bt.full_size_twin(by["S1"], rules) is by["B1"] and bt.full_size_twin(by["S3"], rules) is by["B1"]
+    assert bt.full_size_twin(by["S4"], rules) is by["B5"] and bt.full_size_twin(by["S5"], rules) is by["B5"]
+    assert by["S0"].first_frac == 0.5 and by["S0"].add_at is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:

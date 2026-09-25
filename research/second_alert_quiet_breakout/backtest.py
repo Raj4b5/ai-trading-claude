@@ -30,9 +30,17 @@ Variants
              fill = 'stop'  -> buy-stop at the reference: max(open, ref)
                     'close' -> the session must CLOSE above ref; buy that close
              no break inside the window -> no trade
+  scale-in : buy --first-frac (default 50%) of the slot on the breakout, the rest with a
+             buy-limit at "previous support" if price comes back to it while the trade is
+             open, filled at min(open, level)
+               support = 'retest'    -> the broken high itself (old resistance as support)
+                         'alert_low' -> the alert session's low
+                         'llN'       -> lowest low of the N sessions ending on the alert day
+             the unbought part is held back as cash from the entry; the exit (stop and cap)
+             still runs from the first entry, so the add never moves the stop
 
 Eligibility (2nd alert + volume floor) is identical in every variant, so the
-variants differ only in the quiet filter and the entry timing/price.
+variants differ only in the quiet filter and the entry timing/price/size.
 
 Input data
   --alerts : CSV/XLSX with columns symbol,date (every alert row, not just 2nd alerts;
@@ -190,6 +198,8 @@ class EntryRule:
     window: int = 10
     fill: str = "stop"              # 'stop' | 'close'
     pause: int = 3                  # only for breakout='pause'
+    first_frac: float = 1.0         # share of the slot bought at the entry
+    add_at: str | None = None       # None | 'retest' | 'alert_low' | 'llN': where the rest is bought
 
 
 @dataclass
@@ -202,10 +212,42 @@ class Candidate:
     exit_px: float
     exit_reason: str
     held: int
-    ret: float                      # net of the round-trip cost
+    ret: float                      # net of the round-trip cost, on the capital actually bought
     atr_ratio: float
     lag: int                        # sessions from alert to entry
     premium: float                  # entry fill / alert-session close - 1
+    first_frac: float = 1.0         # share of the slot bought at the entry
+    add_date: pd.Timestamp | None = None
+    add_px: float = math.nan
+    add_level: float = math.nan     # the support level the rest was waiting at
+    add_lag: int = -1               # sessions from entry to the add
+    slot_ret: float | None = None   # on the whole slot, the part never bought counting as idle cash
+
+    def __post_init__(self):
+        if self.slot_ret is None:
+            self.slot_ret = self.ret
+
+
+def breakout_level(s: Series, ai: int, rule: EntryRule) -> float:
+    """The fixed high a breakout rule buys above ('pause' has no fixed level)."""
+    if rule.breakout == "alert":
+        return s.h[ai]
+    if rule.breakout is not None and rule.breakout.startswith("hh"):
+        look = int(rule.breakout[2:])
+        return s.h[max(0, ai - look + 1): ai + 1].max()
+    raise ValueError(f"no fixed breakout level for {rule.breakout!r}")
+
+
+def support_level(s: Series, ai: int, rule: EntryRule) -> float:
+    """The 'previous support' the second part of the position waits at."""
+    if rule.add_at == "retest":
+        return breakout_level(s, ai, rule)          # the broken high, now support
+    if rule.add_at == "alert_low":
+        return s.l[ai]
+    if rule.add_at is not None and rule.add_at.startswith("ll"):
+        look = int(rule.add_at[2:])
+        return s.l[max(0, ai - look + 1): ai + 1].min()
+    raise ValueError(rule.add_at)
 
 
 def find_entry(s: Series, ai: int, rule: EntryRule) -> tuple[int, float] | None:
@@ -222,13 +264,7 @@ def find_entry(s: Series, ai: int, rule: EntryRule) -> tuple[int, float] | None:
             if s.h[j] > hi:
                 hi, hi_i = s.h[j], j
         return None
-    if rule.breakout == "alert":
-        ref = s.h[ai]
-    elif rule.breakout.startswith("hh"):
-        look = int(rule.breakout[2:])
-        ref = s.h[max(0, ai - look + 1): ai + 1].max()
-    else:
-        raise ValueError(rule.breakout)
+    ref = breakout_level(s, ai, rule)
     for j in range(ai + 1, last + 1):
         if rule.fill == "stop" and s.h[j] > ref:
             return j, max(s.o[j], ref)
@@ -252,6 +288,22 @@ def trade_path(s: Series, ei: int, fill: float, k_atr: float, cap: int) -> tuple
     return len(s.c) - 1, s.c[-1], "open"
 
 
+def find_add(s: Series, ei: int, xi: int, why: str, level: float) -> tuple[int, float] | None:
+    """First session after the entry whose low reaches the support level. The resting
+    buy-limit fills at min(open, level), so a gap down fills at the open. It can fill on a
+    trail-exit day, because the stop is only checked on the close, but not on the day the
+    63-session cap closes the trade, and never after the exit."""
+    last = xi - 1 if why == "cap" else xi
+    for j in range(ei + 1, last + 1):
+        if s.l[j] <= level:
+            return j, min(s.o[j], level)
+    return None
+
+
+def leg_ret(entry: float, exit_px: float, cost: float) -> float:
+    return exit_px * (1 - cost / 2) / (entry * (1 + cost / 2)) - 1
+
+
 def build_candidates(sec: pd.DataFrame, series: dict[str, Series], rule: EntryRule,
                      p: argparse.Namespace) -> tuple[list[Candidate], dict]:
     cands, stats = [], defaultdict(int)
@@ -271,12 +323,24 @@ def build_candidates(sec: pd.DataFrame, series: dict[str, Series], rule: EntryRu
             stats["no_breakout"] += 1
             continue
         ei, fill = hit
+        # the exit path depends only on the first entry, so an add never moves the stop
         xi, xpx, why = trade_path(s, ei, fill, p.k_atr, p.cap)
-        ret = xpx * (1 - p.cost / 2) / (fill * (1 + p.cost / 2)) - 1
+        f1, r1 = rule.first_frac, leg_ret(fill, xpx, p.cost)
+        slot_ret, level, add = f1 * r1, math.nan, None
+        if rule.add_at is not None:
+            level = float(support_level(s, ai, rule))
+            add = find_add(s, ei, xi, why, level)
+        if add is not None:
+            slot_ret += (1 - f1) * leg_ret(add[1], xpx, p.cost)
+            stats["added"] += 1
+        bought = f1 if add is None else 1.0
         cands.append(Candidate(r.symbol, r.alert_date, pd.Timestamp(s.dates[ei]), float(fill),
                                None if why == "open" else pd.Timestamp(s.dates[xi]), float(xpx),
-                               why, xi - ei, float(ret), float(ratio), ei - ai,
-                               float(fill / s.c[ai] - 1)))
+                               why, xi - ei, float(slot_ret / bought), float(ratio), ei - ai,
+                               float(fill / s.c[ai] - 1), f1,
+                               None if add is None else pd.Timestamp(s.dates[add[0]]),
+                               math.nan if add is None else float(add[1]), level,
+                               -1 if add is None else add[0] - ei, float(slot_ret)))
         stats["entered"] += 1
     return cands, dict(stats)
 
@@ -291,6 +355,7 @@ class Book:
     sym_row: list
     entry_day: dict
     exit_day: list
+    add_day: list
 
 
 def prepare_book(cands: list[Candidate], series: dict[str, Series], cal: pd.DatetimeIndex,
@@ -308,18 +373,29 @@ def prepare_book(cands: list[Candidate], series: dict[str, Series], cal: pd.Date
     for k, c in enumerate(live):
         entry_day[day[c.entry_date]].append(k)
     exit_day = [day[c.exit_date] if c.exit_date is not None and c.exit_date <= end else None for c in live]
-    return Book(live, wcal, close, [row[c.symbol] for c in live], dict(entry_day), exit_day)
+    add_day = [day[c.add_date] if c.add_date is not None and c.add_date <= end else None for c in live]
+    return Book(live, wcal, close, [row[c.symbol] for c in live], dict(entry_day), exit_day, add_day)
 
 
 def run_book(b: Book, p: argparse.Namespace, seed: int) -> dict:
     if len(b.cal) < 2:
-        return {"cagr": np.nan, "maxdd": np.nan, "trades": 0}
+        return {"cagr": np.nan, "maxdd": np.nan, "trades": 0, "adds": 0, "final": np.nan}
     rng = np.random.default_rng(seed)
     cash, pos, exits, traded, taken = p.capital, {}, defaultdict(list), set(), 0
+    # scale-in: the unbought part of a slot is held back from the entry until the add or the exit
+    held, adds, added = {}, defaultdict(list), 0
     curve = np.empty(len(b.cal))
     for d in range(len(b.cal)):
+        for k in adds.pop(d, ()):                        # buy-limits fill intraday, before the close
+            px = b.live[k].add_px * (1 + p.cost / 2)
+            q = math.floor(held.pop(k) / px)
+            if q >= 1:
+                cash -= q * px
+                pos[k] += q
+                added += 1
         for k in exits.pop(d, ()):                       # exits run before entries
             cash += pos.pop(k) * b.live[k].exit_px * (1 - p.cost / 2)
+            held.pop(k, None)
         todays = b.entry_day.get(d)
         if todays:
             equity = cash + sum(q * b.close[b.sym_row[k], d] for k, q in pos.items())
@@ -329,20 +405,25 @@ def run_book(b: Book, p: argparse.Namespace, seed: int) -> dict:
                 if c.symbol in traded or len(pos) >= p.slots:
                     continue                             # skipped alerts are gone
                 px = c.fill * (1 + p.cost / 2)
-                q = math.floor(min(equity / p.slots, cash) / px)
+                slot = min(equity / p.slots, cash - sum(held.values()))
+                q = math.floor(slot * c.first_frac / px)
                 if q < 1:
                     continue
                 cash -= q * px
                 pos[k] = q
                 traded.add(c.symbol)
                 taken += 1
+                if c.first_frac < 1:                     # held back whether or not the add comes
+                    held[k] = slot * (1 - c.first_frac)
+                    if b.add_day[k] is not None:
+                        adds[b.add_day[k]].append(k)
                 if b.exit_day[k] is not None:
                     exits[b.exit_day[k]].append(k)
         curve[d] = cash + sum(q * b.close[b.sym_row[k], d] for k, q in pos.items())
     years = (b.cal[-1] - b.cal[0]).days / 365.25
     peak = np.maximum.accumulate(curve)
     return {"cagr": (curve[-1] / p.capital) ** (1 / years) - 1, "maxdd": float((curve / peak - 1).min()),
-            "trades": taken}
+            "trades": taken, "adds": added, "final": float(curve[-1])}
 
 
 def pct(x) -> str:
@@ -350,10 +431,30 @@ def pct(x) -> str:
 
 
 def trade_stats(cands: list[Candidate]) -> dict:
-    r = np.array([c.ret for c in cands], float)
+    """Per-slot returns: a scale-in trade that never adds earns only on the part it bought."""
+    r = np.array([c.slot_ret for c in cands], float)
     if not len(r):
         return {"n": 0, "mean": np.nan, "median": np.nan, "win": np.nan}
     return {"n": len(r), "mean": float(r.mean()), "median": float(np.median(r)), "win": float((r > 0).mean())}
+
+
+def scale_stats(cands: list[Candidate], cost: float) -> dict | None:
+    """What the second half did: how often it filled, how soon, how cheaply, and what it earned."""
+    sc = [c for c in cands if c.first_frac < 1]
+    if not sc:
+        return None
+    yes = [c for c in sc if c.add_date is not None]
+    no = [c for c in sc if c.add_date is None]
+    mean = lambda xs: float(np.mean(xs)) if xs else np.nan
+    med = lambda xs: float(np.median(xs)) if xs else np.nan
+    return {"trades": len(sc), "added": len(yes), "add_rate": len(yes) / len(sc),
+            "median_sessions_to_add": med([c.add_lag for c in yes]),
+            "median_add_vs_fill": med([c.add_px / c.fill - 1 for c in yes]),
+            "slot_ret_added": mean([c.slot_ret for c in yes]),
+            "slot_ret_not_added": mean([c.slot_ret for c in no]),
+            "add_leg_ret": mean([leg_ret(c.add_px, c.exit_px, cost) for c in yes]),
+            "add_leg_win": mean([leg_ret(c.add_px, c.exit_px, cost) > 0 for c in yes]),
+            "ret_on_bought": mean([c.ret for c in sc])}
 
 
 def summarise(rule: EntryRule, cands: list[Candidate], stats: dict, series, cal, p,
@@ -361,7 +462,8 @@ def summarise(rule: EntryRule, cands: list[Candidate], stats: dict, series, cal,
     out = {"rule": asdict(rule), "funnel": stats, **trade_stats(cands),
            "median_lag": float(np.median([c.lag for c in cands])) if cands else np.nan,
            "median_premium": float(np.median([c.premium for c in cands])) if cands else np.nan,
-           "exit_mix": {k: int(v) for k, v in pd.Series([c.exit_reason for c in cands]).value_counts().items()}}
+           "exit_mix": {k: int(v) for k, v in pd.Series([c.exit_reason for c in cands]).value_counts().items()},
+           "scale_in": scale_stats(cands, p.cost)}
     for label, a, b in windows:
         book = prepare_book(cands, series, cal, a, b)
         runs = [run_book(book, p, seed) for seed in range(p.seeds)]
@@ -370,25 +472,35 @@ def summarise(rule: EntryRule, cands: list[Candidate], stats: dict, series, cal,
         out[label] = {"cagr_median": float(np.nanmedian(cg)), "cagr_p10": float(np.nanpercentile(cg, 10)),
                       "cagr_p90": float(np.nanpercentile(cg, 90)), "maxdd_median": float(np.nanmedian(dd)),
                       "trades_median": float(np.median([x["trades"] for x in runs])),
+                      "adds_median": float(np.median([x["adds"] for x in runs])),
                       "per_trade": trade_stats(book.live)}
     return out
 
 
 def paired(base: list[Candidate], other: list[Candidate], big: float = 0.30) -> dict:
-    """Same symbols, different entry: what the variant changes trade by trade."""
-    b = {c.symbol: c.ret for c in base}
-    o = {c.symbol: c.ret for c in other}
+    """Same symbols, different entry: what the variant changes trade by trade (per slot)."""
+    b = {c.symbol: c.slot_ret for c in base}
+    o = {c.symbol: c for c in other}
     common = sorted(b.keys() & o.keys())
-    diff = np.array([o[s] - b[s] for s in common], float)
+    diff = np.array([o[s].slot_ret - b[s] for s in common], float)
     winners = [s for s, r in b.items() if r >= big]
     return {"common": len(common),
             "mean_diff": float(diff.mean()) if len(diff) else np.nan,
             "median_diff": float(np.median(diff)) if len(diff) else np.nan,
             "base_big_winners": len(winners),
-            "big_winners_missed": sum(1 for s in winners if s not in o)}
+            "big_winners_missed": sum(1 for s in winners if s not in o),
+            "big_winners_part_size": sum(1 for s in winners if s in o and o[s].first_frac < 1
+                                         and o[s].add_date is None)}
 
 
-def default_rules() -> list[EntryRule]:
+def full_size_twin(rule: EntryRule, rules: list[EntryRule]) -> EntryRule | None:
+    """The same entry bought in one go, to read a scale-in against."""
+    return next((r for r in rules if r.first_frac == 1 and r.add_at is None and r.quiet == rule.quiet
+                 and r.breakout == rule.breakout and r.window == rule.window and r.fill == rule.fill), None)
+
+
+def default_rules(first_frac: float = 0.5) -> list[EntryRule]:
+    f, g = f"{first_frac:.0%}", f"{1 - first_frac:.0%}"
     return [
         EntryRule("A0 baseline: buy 2nd-alert close"),
         EntryRule("A1 quiet only: buy 2nd-alert close", quiet=True),
@@ -402,6 +514,20 @@ def default_rules() -> list[EntryRule]:
         EntryRule("C0 all, pause >=3d then break post-alert high (20d)", breakout="pause", window=20),
         EntryRule("C1 quiet + pause >=3d then break post-alert high (20d)", quiet=True, breakout="pause",
                   window=20),
+        # scale-in: part of the slot on the break of the previous high, the rest if price comes back
+        # to "previous support" while the trade is open. S0 never adds, so S1-S3 minus S0 is the add.
+        EntryRule(f"S0 quiet + break alert-day high: {f} there, never add", quiet=True, breakout="alert",
+                  first_frac=first_frac),
+        EntryRule(f"S1 quiet + break alert-day high: {f} there, {g} on a retest of that high", quiet=True,
+                  breakout="alert", first_frac=first_frac, add_at="retest"),
+        EntryRule(f"S2 quiet + break alert-day high: {f} there, {g} at the alert-day low", quiet=True,
+                  breakout="alert", first_frac=first_frac, add_at="alert_low"),
+        EntryRule(f"S3 quiet + break alert-day high: {f} there, {g} at the 20-session base low", quiet=True,
+                  breakout="alert", first_frac=first_frac, add_at="ll20"),
+        EntryRule(f"S4 quiet + break 20-session high: {f} there, {g} on a retest of that high", quiet=True,
+                  breakout="hh20", first_frac=first_frac, add_at="retest"),
+        EntryRule(f"S5 quiet + break 20-session high: {f} there, {g} at the 20-session base low", quiet=True,
+                  breakout="hh20", first_frac=first_frac, add_at="ll20"),
     ]
 
 
@@ -418,13 +544,44 @@ def report(results: list[dict], windows) -> str:
             cells += [f"{pct(x['cagr_median'])} ({pct(x['cagr_p10'])}..{pct(x['cagr_p90'])})",
                       pct(x["maxdd_median"])]
         lines.append("| " + " | ".join(cells) + " |")
-    lines += ["", "Paired against A0 (same symbols, only the entry differs):", "",
-              "| variant | symbols in both | mean diff / trade | median diff | A0 winners >= +30% missed |",
-              "|---|---|---|---|---|"]
+    lines += ["", "Per-trade figures are per slot: a scale-in that never adds earns only on the part it bought.",
+              "", "Paired against A0 (same symbols, only the entry differs):", "",
+              "| variant | symbols in both | mean diff / trade | median diff | A0 winners >= +30% missed "
+              "| ... held at part size |",
+              "|---|---|---|---|---|---|"]
     for r in results[1:]:
         x = r["paired_vs_A0"]
+        part = str(x["big_winners_part_size"]) if r["rule"]["first_frac"] < 1 else "-"
         lines.append(f"| {r['rule']['name']} | {x['common']} | {pct(x['mean_diff'])} | {pct(x['median_diff'])} "
-                     f"| {x['big_winners_missed']} of {x['base_big_winners']} |")
+                     f"| {x['big_winners_missed']} of {x['base_big_winners']} | {part} |")
+    scaled = [r for r in results if r["scale_in"]]
+    if scaled:
+        full = windows[0][0]
+        lines += ["", "Scale-in: what the second part did", "",
+                  "| variant | trades | 2nd part filled | median sessions to fill | fill vs first entry "
+                  "| slot return, filled | slot return, not filled | 2nd part's own return (win) "
+                  "| return on money bought |",
+                  "|---|---|---|---|---|---|---|---|---|"]
+        for r in scaled:
+            x = r["scale_in"]
+            days = "n/a" if math.isnan(x["median_sessions_to_add"]) else f"{x['median_sessions_to_add']:.0f}"
+            lines.append(f"| {r['rule']['name']} | {x['trades']} | {x['added']} ({win(x['add_rate'])}) | {days} "
+                         f"| {pct(x['median_add_vs_fill'])} | {pct(x['slot_ret_added'])} "
+                         f"| {pct(x['slot_ret_not_added'])} | {pct(x['add_leg_ret'])} ({win(x['add_leg_win'])}) "
+                         f"| {pct(x['ret_on_bought'])} |")
+        lines += ["", "Scale-in against the same entry bought in one go (same symbols):", "",
+                  f"| variant | bought in one go | mean diff / trade | median diff | CAGR {full}: scale-in "
+                  f"vs one go | maxDD {full}: scale-in vs one go |",
+                  "|---|---|---|---|---|---|"]
+        by_name = {r["rule"]["name"]: r for r in results}
+        for r in scaled:
+            x, t = r.get("paired_vs_twin"), by_name.get(r.get("twin"))
+            if x is None or t is None:
+                continue
+            a, b = r[full], t[full]
+            lines.append(f"| {r['rule']['name']} | {t['rule']['name'][:2]} | {pct(x['mean_diff'])} "
+                         f"| {pct(x['median_diff'])} | {pct(a['cagr_median'])} vs {pct(b['cagr_median'])} "
+                         f"| {pct(a['maxdd_median'])} vs {pct(b['maxdd_median'])} |")
     return "\n".join(lines)
 
 
@@ -506,6 +663,8 @@ def main(argv=None) -> int:
     ap.add_argument("--quiet-max", type=float, default=1.0)
     ap.add_argument("--capital", type=float, default=1_000_000)
     ap.add_argument("--seeds", type=int, default=200)
+    ap.add_argument("--first-frac", type=float, default=0.5,
+                    help="scale-in (S rows): share of the slot bought on the breakout, the rest at support")
     ap.add_argument("--out", default="results")
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--check-known", metavar="CSV",
@@ -522,6 +681,8 @@ def main(argv=None) -> int:
         p.seeds = min(p.seeds, 20)
     if not (p.alerts and p.prices):
         ap.error("--alerts and --prices are required (or --demo)")
+    if not 0 < p.first_frac < 1:
+        ap.error("--first-frac must be between 0 and 1")
 
     alerts = load_alerts(p.alerts, p.alerts_sheet)
     raw = load_prices(p.prices, set(alerts["symbol"]))
@@ -535,12 +696,18 @@ def main(argv=None) -> int:
     print(f"{len(alerts)} alert rows, {alerts['symbol'].nunique()} symbols, "
           f"{len(series)} with prices, {len(sec)} second alerts in window", file=sys.stderr)
 
-    results, trades, base = [], [], None
-    for rule in default_rules():
+    rules = default_rules(p.first_frac)
+    results, trades, base, by_rule = [], [], None, {}
+    for rule in rules:
         cands, stats = build_candidates(sec, series, rule, p)
         res = summarise(rule, cands, stats, series, cal, p, windows)
         base = cands if base is None else base
         res["paired_vs_A0"] = paired(base, cands)
+        twin = full_size_twin(rule, rules) if rule.first_frac < 1 else None
+        if twin is not None and twin in by_rule:
+            res["twin"] = twin.name
+            res["paired_vs_twin"] = paired(by_rule[twin], cands)
+        by_rule[rule] = cands
         results.append(res)
         trades += [{**asdict(c), "variant": rule.name} for c in cands]
         print(f"done: {rule.name}  ({len(cands)} candidate trades)", file=sys.stderr)

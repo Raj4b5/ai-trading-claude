@@ -6,8 +6,13 @@ screener alert:
 > When a stock goes *quiet* into its second alert, what is the return if we skip the
 > alert-close buy, wait for the stock to **break the previous high**, and enter there?
 
+It also tests a follow-up question:
+
+> After the quiet base, buy **50%** on the break of the previous high, then the other **50%**
+> if the stock comes back to the **previous support**. What does that return?
+
 Everything except the entry is held at the baseline rules, so any change in return comes from
-the quiet filter and the entry timing alone.
+the quiet filter and the entry timing and size alone.
 
 ## Definitions
 
@@ -64,12 +69,60 @@ baseline, so every other row reads directly as "what this entry change does".
 | B5 | quiet + break of the 20-session high |
 | B6 | quiet + break of the 60-session base high within 20 sessions |
 | C0 / C1 | (all / quiet) at least 3 quiet sessions after the alert, then a break of the post-alert high |
+| S0–S5 | scale-in: see the next section |
+
+## Scale-in: 50% on the break, 50% back at support
+
+The first part (`--first-frac`, default 0.5) is bought exactly as in B1 or B5: a quiet second
+alert, then a buy-stop on the break of the previous high. The rest waits in a buy-limit at the
+"previous support". If any session's low reaches that level while the trade is open, the
+limit fills at `min(open, level)`, so a gap down fills at the open. "Previous support" can be
+read three ways, so the harness tests each:
+
+| code | support level | reads as |
+|---|---|---|
+| `retest` | the broken high itself | old resistance turns into support, and the break is retested |
+| `alert_low` | the low of the second-alert session | the alert candle's support |
+| `ll20` | the lowest low of the 20 sessions ending on the alert day | the floor of the quiet base |
+
+| id | first part bought on | rest bought at |
+|---|---|---|
+| S0 | break of the alert-day high (as B1) | never. This is the control, so S1–S3 minus S0 is what the add is worth |
+| **S1** | break of the alert-day high | a retest of that high |
+| **S2** | break of the alert-day high | the alert-day low |
+| **S3** | break of the alert-day high | the 20-session base low |
+| S4 | break of the 20-session high (as B5) | a retest of that high |
+| S5 | break of the 20-session high | the 20-session base low |
+
+How the add is modelled:
+
+- **The exit runs from the first entry**, unchanged. The add doesn't move the trailing stop or
+  restart the 63-session cap, and both parts leave together.
+- **The add can fill on a trail-exit day.** The limit fills intraday and the stop is checked on
+  the close. It can't fill on the entry day, on the day the cap closes the trade, or after the exit.
+- **The unbought part is held back as cash from the entry.** On the day you buy the first half
+  you can't know whether the pullback will come, so that cash isn't lent to other alerts. It is
+  spent at the add or released at the exit. Idle cash earns nothing, and that cost is included.
+- **Per-trade returns are per slot.** A trade that never adds earns only on the part it bought,
+  because the other part sat in cash. That makes S rows comparable with A0 and B1, which use a
+  whole slot. The scale-in table also shows the return on money actually bought.
+
+Extra outputs for the S rows:
+
+- **What the second part did:** how often it filled and how many sessions after the entry, the
+  add price against the first fill, and the slot return with and without the fill. It also
+  shows the second part's own return and win rate, because buying the pullback only helps if
+  the pullback trades recover.
+- **Each S row against the same entry bought in one go** (S1–S3 against B1, S4–S5 against B5),
+  with the same symbols and the CAGR and drawdown side by side.
+- **A0 winners of +30% or more held at part size:** big runners that never came back to support,
+  so only half of the position ever rode them.
 
 ## Running it
 
 ```bash
 pip install pandas numpy                 # openpyxl too, for .xlsx alert files
-python3 test_backtest.py                 # 11 hand-checkable tests
+python3 test_backtest.py                 # 17 hand-checkable tests
 python3 backtest.py --demo               # synthetic data, machinery check only
 
 python3 backtest.py \
@@ -84,6 +137,8 @@ python3 backtest.py ... --k-atr 4 --out results_k4
 - `--second-alerts` treats each alert row as a symbol's second alert, for when you already have
   that list.
 - `--count-from YYYY-MM-DD` starts the alert count at a later date.
+- `--first-frac 0.33` changes the scale-in split, for example a third on the break and two thirds
+  at support.
 - Prices must be adjusted for splits and bonuses, with columns `date,open,high,low,close,volume`.
 
 **Reconcile before trusting a result.** `--check-known trades.csv --prices prices/` replays trades
@@ -96,7 +151,9 @@ Outputs, in `--out`:
 - `summary.md`: per-variant trades, mean/median return per trade, win rate, the median lag from
   alert to entry, the entry premium over the alert close, and CAGR (median, p10–p90) with max
   drawdown for the full window and both eras. It also has a paired table against A0 on the same
-  symbols.
-- `summary.json`: the same numbers plus the funnel (eligible, not quiet, unscored, no breakout).
+  symbols, plus the two scale-in tables.
+- `summary.json`: the same numbers plus the funnel (eligible, not quiet, unscored, no breakout,
+  second part filled).
 - `candidate_trades.csv`: every candidate trade in every variant, with entry, exit, reason and
-  return.
+  return. S rows also carry `first_frac`, `add_date`, `add_px`, `add_level`, `add_lag` and
+  `slot_ret`. `ret` is the return on the money actually bought.
