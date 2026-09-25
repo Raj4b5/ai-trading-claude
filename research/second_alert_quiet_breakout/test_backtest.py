@@ -102,6 +102,24 @@ def test_second_alert_counts_distinct_sessions_and_rolls_holidays():
     assert row.alert_i == monday and row.n_alert_sessions == 3
 
 
+def test_alerts_before_price_history_count_but_are_not_folded_into_bar_0():
+    s = series_from([100.0] * 50, start="2024-03-04")          # a Monday; history starts here
+    d = pd.DatetimeIndex(s.dates)
+    early1, early2 = pd.Timestamp("2024-01-10"), pd.Timestamp("2024-01-22")
+    # two alerts before the history: the one on d[10] is the third, so there is no tradable 2nd alert
+    three = pd.DataFrame({"symbol": ["AAA"] * 3, "date": [early1, early2, d[10]]})
+    assert len(bt.second_alerts(three, {"AAA": s})) == 0
+    # one alert before the history: d[10] is the second
+    two = pd.DataFrame({"symbol": ["AAA"] * 2, "date": [early1, d[10]]})
+    row = bt.second_alerts(two, {"AAA": s}).iloc[0]
+    assert row.alert_i == 10 and row.n_alert_sessions == 2
+    # a Sunday alert the day before the history starts rolls onto its first session
+    sunday = pd.DataFrame({"symbol": ["AAA"] * 2, "date": [pd.Timestamp("2024-03-03"), d[10]]})
+    assert bt.second_alerts(sunday, {"AAA": s}).iloc[0].alert_i == 10
+    given = pd.DataFrame({"symbol": ["AAA"], "date": [early2]})
+    assert len(bt.given_second_alerts(given, {"AAA": s})) == 0
+
+
 def test_slots_bind_and_ties_are_random():
     # 8 symbols all alert on the same day; 5 slots -> exactly 5 entries, varying by seed
     series, rows = {}, []

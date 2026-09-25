@@ -18,6 +18,8 @@ the quiet filter and the entry timing and size alone.
 
 **Second alert.** The symbol's true second alert session, counted across the whole alert history.
 A third or later alert never qualifies. Alerts stamped on a holiday roll to the next session.
+Alerts dated before a stock's price history starts still count, one per day, but can't be
+traded. They aren't folded into the first bar.
 
 **Quiet.** ATR(14) on the alert day divided by ATR(14) sixty sessions earlier is below 1, meaning
 volatility contracted into the alert. Alerts with fewer than 74 bars of history cannot be scored,
@@ -122,7 +124,7 @@ Extra outputs for the S rows:
 
 ```bash
 pip install pandas numpy                 # openpyxl too, for .xlsx alert files
-python3 test_backtest.py                 # 17 hand-checkable tests
+python3 test_backtest.py                 # 18 hand-checkable tests
 python3 backtest.py --demo               # synthetic data, machinery check only
 
 python3 backtest.py \
@@ -140,6 +142,37 @@ python3 backtest.py ... --k-atr 4 --out results_k4
 - `--first-frac 0.33` changes the scale-in split, for example a third on the break and two thirds
   at support.
 - Prices must be adjusted for splits and bonuses, with columns `date,open,high,low,close,volume`.
+
+### Prices from Zerodha Kite
+
+`fetch_kite.py` downloads daily candles from Kite Connect into the folder layout `--prices`
+reads. It needs a Kite Connect app with historical-data access, network access to
+`api.kite.trade`, and two environment variables set in the environment's settings, never in
+code or chat: `KITE_API_KEY` and `KITE_ACCESS_TOKEN`. Kite expires access tokens every morning.
+
+```bash
+pip install pandas numpy openpyxl requests
+python3 test_fetch_kite.py               # offline, against a fake Kite server
+python3 fetch_kite.py --alerts data/alerts.xlsx --alerts-sheet "<sheet name>" --out data/prices
+python3 backtest.py --alerts data/alerts.xlsx --alerts-sheet "<sheet name>" --prices data/prices \
+  --out results_k55
+python3 backtest.py --alerts data/alerts.xlsx --alerts-sheet "<sheet name>" --prices data/prices \
+  --k-atr 4 --out results_k4
+```
+
+- It fetches every stock with at least two alert days, starting 200 days before the first
+  alert, so the ATR and the 60-session quiet lookback have history.
+- It stays under Kite's 3 requests a second and retries rate limits.
+- It stops at once if the token has expired or the app lacks historical access.
+- Files already downloaded are kept, so a rerun resumes.
+- `data/prices_report.csv` lists every stock: the instrument used (EQ series first, then BE/BZ
+  and SME), the bars fetched, and whether the stock is missing from Kite today. A delisted or
+  renamed stock can't be fetched, which leaves out mostly the worst trades, so check how many
+  are missing. The report also lists overnight gaps big enough to be an unadjusted split or
+  bonus. A few are normal; many mean the candles aren't adjusted.
+
+This repository is public, so `data/`, `prices*/`, spreadsheets and alert CSVs are gitignored.
+Keep alert lists and broker data out of commits.
 
 **Reconcile before trusting a result.** `--check-known trades.csv --prices prices/` replays trades
 your own engine reported and compares exit date, price and reason, with one row per trade and

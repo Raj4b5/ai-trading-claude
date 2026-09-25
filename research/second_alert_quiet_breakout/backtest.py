@@ -160,12 +160,18 @@ def prepare(df: pd.DataFrame, atr_n: int) -> Series:
 
 # ------------------------------------------------------------------------ signals
 
+def before_history(dates: pd.DatetimeIndex, s: Series) -> np.ndarray:
+    """Alerts that fall before the price history starts, even after a weekend date rolls to
+    Monday. They can't be placed on a session, so searchsorted would fold them all into bar 0."""
+    return np.asarray((dates + pd.offsets.BDay(0)) < pd.Timestamp(s.dates[0]))
+
+
 def given_second_alerts(alerts: pd.DataFrame, series: dict[str, Series]) -> pd.DataFrame:
     """Rows are already second alerts (one per symbol): just roll each to its session."""
     rows = []
     for r in alerts.sort_values("date").drop_duplicates("symbol").itertuples(index=False):
         s = series.get(r.symbol)
-        if s is None:
+        if s is None or before_history(pd.DatetimeIndex([r.date]), s)[0]:
             continue
         i = int(np.searchsorted(s.dates, np.datetime64(r.date, "ns")))
         if i < len(s.dates):
@@ -182,11 +188,16 @@ def second_alerts(alerts: pd.DataFrame, series: dict[str, Series],
         s = series.get(sym)
         if s is None:
             continue
+        # alerts before the price history still count, one per distinct day, but can't be traded
+        dates = pd.DatetimeIndex(g["date"])
+        early = before_history(dates, s)
+        n_early = len(set(dates[early] + pd.offsets.BDay(0)))
         # roll holiday-stamped alerts to the next session, then count distinct sessions
-        idx = np.searchsorted(s.dates, g["date"].to_numpy(dtype="datetime64[ns]"), side="left")
+        idx = np.searchsorted(s.dates, dates[~early].to_numpy(dtype="datetime64[ns]"), side="left")
         sessions = sorted(set(int(i) for i in idx if i < len(s.dates)))
-        if len(sessions) >= 2:
-            rows.append((sym, pd.Timestamp(s.dates[sessions[1]]), sessions[1], len(sessions)))
+        if n_early < 2 and n_early + len(sessions) >= 2:
+            i = sessions[1 - n_early]
+            rows.append((sym, pd.Timestamp(s.dates[i]), i, n_early + len(sessions)))
     return pd.DataFrame(rows, columns=["symbol", "alert_date", "alert_i", "n_alert_sessions"])
 
 

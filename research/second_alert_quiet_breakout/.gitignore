@@ -1,1 +1,9 @@
 results*/
+# the repo is public: keep alert lists and broker price data out of it
+data/
+prices*/
+*.xlsx
+*.xls
+alerts*.csv
+*_report.csv
+__pycache__/
